@@ -6,7 +6,7 @@ import asyncio
 import RPi.GPIO as GPIO
 import reolinkapi
 from concurrent.futures import ProcessPoolExecutor
-from telethon import TelegramClient, events, functions, types
+from telethon import TelegramClient, Button, events, functions, types
 
 
 logging.basicConfig(format="[%(levelname)s] %(message)s")
@@ -20,6 +20,28 @@ from secrets import *
 
 GARAGE_DOOR = 21
 
+KEYBOARD = [
+    [
+        Button.text("📷\nGarage"),
+        Button.text("📷\nDriveway"),
+        Button.text("📷\nShed"),
+        Button.text("📷\nPaddock"),
+    ],
+    [Button.text("↕️ Garage")],
+]
+
+# KEYBOARD = [
+#     [
+#         Button.inline("📷 Garage", b"snap_garage"),
+#         Button.inline("📷 Driveway", b"snap_driveway"),
+#     ],
+#     [
+#         Button.inline("📷 Shed", b"snap_shed"),
+#         Button.inline("📷 Paddock", b"snap_paddock"),
+#     ],
+#     [Button.inline("↕️ Garage", b"toggle")],
+# ]
+
 
 async def toggle_relay(relay):
     GPIO.setmode(GPIO.BCM)
@@ -29,6 +51,7 @@ async def toggle_relay(relay):
     GPIO.output(relay, False)
     await asyncio.sleep(0.1)
     GPIO.cleanup()
+
 
 async def save_video(duration=15, filename="capture.mp4"):
     rtmp_url = f"rtmp://{CAMERA_URL}/bcs/channel0_ext.bcs?channel=0&stream=3&user={CAMERA_USER}&password={CAMERA_PASS}"
@@ -84,6 +107,7 @@ async def combine_audio_video_async(audio, video, output, loop=None):
 
 
 with TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN) as bot:
+
     @bot.on(events.NewMessage)
     async def bouncer(event):
         if event.sender_id in (JASON, CHELSEA):
@@ -91,21 +115,27 @@ with TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN) as bot:
         await event.respond("Forbidden.")
         user = await bot.get_entity(event.sender_id)
         try:
-            logger.info(f"[FORBIDDEN] by id={user.id}; {user.first_name} {user.last_name}.")
+            logger.info(
+                f"[FORBIDDEN] by id={user.id}; {user.first_name} {user.last_name}."
+            )
         except:
-            logger.info(f"[FORBIDDEN] id={event.sender_id}; non-user has been forbidden.")
+            logger.info(
+                f"[FORBIDDEN] id={event.sender_id}; non-user has been forbidden."
+            )
         raise events.StopPropagation
-
 
     @bot.on(events.NewMessage(pattern="/start"))
     async def start_handler(event):
         user = await bot.get_entity(event.sender_id)
-        await event.respond(f"Use /toggle to open or close the garage door.")
+        await event.respond(
+            f"Take a photo or toggle the garage door.", buttons=KEYBOARD
+        )
         logger.info(f"[START] by id={user.id}; {user.first_name} {user.last_name}.")
         raise events.StopPropagation
 
-
+    @bot.on(events.NewMessage(pattern="↕️ Garage"))
     @bot.on(events.NewMessage(pattern="/toggle"))
+    @bot.on(events.CallbackQuery(data=b"toggle"))
     async def toggle_handler(event):
         upload = None
         await bot(
@@ -148,9 +178,11 @@ with TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN) as bot:
         recipients = list(set([JASON, CHELSEA, event.sender_id]))
         for recipient in recipients:
             if recipient == event.sender_id:
-                await event.reply(message, file=upload)
+                await event.reply(message, file=upload, buttons=KEYBOARD)
             else:
-                await bot.send_message(recipient, message, file=upload)
+                await bot.send_message(
+                    recipient, message, file=upload, buttons=KEYBOARD
+                )
         logger.info(f"[TOGGLE] {message}")
 
         await asyncio.sleep(1)
@@ -160,15 +192,34 @@ with TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN) as bot:
 
         raise events.StopPropagation
 
-
     @bot.on(events.NewMessage(pattern=r"\/snap_(garage|shed|driveway|paddock)"))
-    async def check_handler(event):
-        await bot(
-            functions.messages.SetTypingRequest(
-                peer=event.sender_id, action=types.SendMessageTypingAction()
-            )
-        )
+    async def snap_handler(event):
         where = event.text.strip()[6:]
+        await snap_response(event, where)
+        raise events.StopPropagation
+
+    @bot.on(events.NewMessage(pattern=r"(?i)^📷\n(garage|shed|driveway|paddock)"))
+    async def snap_handler(event):
+        where = event.text.lower().replace("📷\n", "").strip()
+        await snap_response(event, where)
+        raise events.StopPropagation
+
+    @bot.on(events.CallbackQuery(data=b"snap_garage"))
+    @bot.on(events.CallbackQuery(data=b"snap_driveway"))
+    @bot.on(events.CallbackQuery(data=b"snap_shed"))
+    @bot.on(events.CallbackQuery(data=b"snap_paddock"))
+    async def snap_callback_handler(event):
+        where = "shed"
+        if event.data == b"snap_garage":
+            where = "garage"
+        elif event.data == b"snap_driveway":
+            where = "driveway"
+        elif event.data == b"snap_paddock":
+            where = "paddock"
+        await snap_response(event, where)
+        raise events.StopPropagation
+
+    async def snap_response(event, where):
         presets = dict(
             garage=PRESET_GARAGE,
             driveway=PRESET_DRIVEWAY,
@@ -177,14 +228,19 @@ with TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN) as bot:
         )
         filename = f"snap_{where}.png"
         logger.info(f"[SNAP] {where}")
+        await bot(
+            functions.messages.SetTypingRequest(
+                peer=event.sender_id, action=types.SendMessageTypingAction()
+            )
+        )
         try:
             camera = reolinkapi.Camera(CAMERA_URL, CAMERA_USER, CAMERA_PASS)
             camera.go_to_preset(index=presets[where])
             await asyncio.sleep(1)
             await take_photo(filename)
-            await event.reply(file=filename)
+            await event.reply(file=filename, buttons=KEYBOARD)
         except:
-            await event.reply("error")
+            await event.reply("error", buttons=KEYBOARD)
 
         await asyncio.sleep(1)
         camera.go_to_preset(index=PRESET_SHED)
@@ -195,7 +251,45 @@ with TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN) as bot:
         )
         if os.path.exists(filename):
             os.remove(filename)
+
+    @bot.on(events.NewMessage(pattern=r"\/video_(garage|shed|driveway|paddock)"))
+    async def video_handler(event):
+        where = event.text.strip()[7:]
+        await video_response(event, where)
         raise events.StopPropagation
+
+    async def video_response(event, where, duration=10):
+        presets = dict(
+            garage=PRESET_GARAGE,
+            driveway=PRESET_DRIVEWAY,
+            shed=PRESET_SHED,
+            paddock=PRESET_PADDOCK,
+        )
+        filename = f"video_{where}.mp4"
+        logger.info(f"[VIDEO] {where}")
+        await bot(
+            functions.messages.SetTypingRequest(
+                peer=event.sender_id, action=types.SendMessageTypingAction()
+            )
+        )
+        try:
+            camera = reolinkapi.Camera(CAMERA_URL, CAMERA_USER, CAMERA_PASS)
+            camera.go_to_preset(index=presets[where])
+            await asyncio.sleep(1)
+            await save_video(duration, filename)
+            await event.reply(file=filename, buttons=KEYBOARD)
+        except:
+            await event.reply("error", buttons=KEYBOARD)
+
+        await asyncio.sleep(1)
+        camera.go_to_preset(index=PRESET_SHED)
+        await bot(
+            functions.messages.SetTypingRequest(
+                peer=event.sender_id, action=types.SendMessageCancelAction()
+            )
+        )
+        if os.path.exists(filename):
+            os.remove(filename)
 
 
     @bot.on(events.NewMessage(pattern=r"/(spin|konami|↑↑↓↓←→←→BA|⬆⬆⬇⬇⬅➡⬅➡🅱🅰)"))
@@ -214,9 +308,9 @@ with TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN) as bot:
             if "spin" not in event.text:
                 await combine_audio_video_async("konami.m4a", filename, "konami.mp4")
                 filename = "konami.mp4"
-            await event.reply(file=filename)
+            await event.reply(file=filename, buttons=KEYBOARD)
         except:
-            await event.reply("error")
+            await event.reply("error", buttons=KEYBOARD)
         await asyncio.sleep(1)
         camera.go_to_preset(index=PRESET_SHED)
         await bot(
@@ -230,6 +324,9 @@ with TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN) as bot:
             os.remove("konami.mp4")
         raise events.StopPropagation
 
+    @bot.on(events.NewMessage(pattern="/options"))
+    async def handler(event):
+        await event.respond("options", buttons=KEYBOARD)
+
     logger.info("hello!")
     bot.run_until_disconnected()
-

@@ -3,3 +3,5 @@ logs/
 *.session
 *.session-journal
 secrets.py
+*.mp4
+*.png
